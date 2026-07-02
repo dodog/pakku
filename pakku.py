@@ -3,27 +3,7 @@
 Pakku — PAMAC-like package manager for Manjaro/Arch
 with real changelogs for Pacman, AUR, Flatpak, and Snap.
 
-All 20 improvements implemented:
-  #1  Mappings loaded in background — UI appears instantly
-  #2  Changelog DB save is debounced (max once per 30s, always on exit)
-  #3  Update detection runs after UI is shown, badges patch in live
-  #4  Sync DB names read directly from /var/lib/pacman/sync/*.db (no subprocess)
-  #5  Package loading is fully parallelised with ThreadPoolExecutor
-  #6  Changelog cache entries expire after 7 days; stale shown with warning
-  #7  shlex.quote() used for all package names in terminal commands
-  #8  Dead _flatpak_appstream_info() removed
-  #9  _cmd_exists() uses shutil.which() — no subprocess
-  #10 paru uses correct flags (-Qua without --aur)
-  #11 Changelog DB keyed by "repo:name" to avoid collisions
-  #12 Mozilla/Blender per-version page fetches run in parallel
-  #13 AppStream XML re-enabled with fixed per-component regex
-  #14 Keyboard Up/Down navigation updates detail panel
-  #15 "Select all" hidden when filter isn't "updates"
-  #16 Sort options: A-Z, Z-A, size, updates-first
-  #17 "Update all" button in Updates view
-  #18 Footer updates dynamically per view
-  #19 Banner shown when sync_names is empty
-  #20 Flatpak Files tab walks real deploy directory
+
 
 Requirements:
     sudo pacman -S python-gobject gtk4 libadwaita pacman-contrib
@@ -40,7 +20,10 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Gdk, Gio, Pango
 
-import gzip, html, json, os, re, shlex, shutil, sys, tarfile, threading, time
+# Disable WebKit process sandbox when user namespaces are unavailable
+# (avoids "CanCreateUserNamespace() clone() failure: EPERM" on some systems)
+import gzip, html, json, os, re, shlex, shutil, sys, tarfile, tempfile, threading, time
+os.environ.setdefault("WEBKIT_DISABLE_SANDBOX", "1")
 import subprocess, urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -87,6 +70,13 @@ def run(cmd: list, timeout: int = 30) -> tuple:
         return "", f"not found: {cmd[0]}", 127
     except subprocess.TimeoutExpired:
         return "", "timeout", 1
+
+
+def run_git(cmd: list, timeout: int = 10) -> tuple:
+    """Run git command with shorter timeout (git can hang on blocked repos).
+    Default timeout is 10s vs 30s for general commands.
+    """
+    return run(cmd, timeout=timeout)
 
 
 # ─── Debug tracing ────────────────────────────────────────────────────────────
@@ -141,21 +131,67 @@ def http_get_json(url: str, timeout: int = 14):
     """
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0",
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
         })
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 406:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                })
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    body = r.read().decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        else:
+            return None
     except Exception:
         return None
     try:
         return json.loads(body)
     except Exception:
         return None
+
+
+def _is_bot_protection_page(body: str) -> bool:
+    """Detect common bot-protection services returning challenge pages.
+    Returns True if the page looks like Anubis, Cloudflare, or similar.
+    """
+    if not body:
+        return False
+    low = body.lower()
+    return ("anubis" in low or "making sure you" in low or 
+            "cloudflare" in low or "captcha" in low or
+            "challenge" in low)
+
+
+# ─── HTTP caching (short-lived session cache to avoid re-fetching) ──────────
+
+_http_cache: dict[str, tuple[str, float]] = {}
+_HTTP_CACHE_TTL = 30  # seconds
+
+def http_get_cached(url: str, timeout: int = 14) -> Optional[str]:
+    """Fetch URL with short-lived session cache (30s TTL).
+    Avoids re-fetching the same URL multiple times in quick succession.
+    """
+    now = time.time()
+    if url in _http_cache:
+        body, ts = _http_cache[url]
+        if now - ts < _HTTP_CACHE_TTL:
+            return body
+    body = http_get(url, timeout)
+    if body:
+        _http_cache[url] = (body, now)
+    return body
 
 
 # Fix #9 — shutil.which() instead of spawning `which`
@@ -667,14 +703,55 @@ CL_MAX_AGE_S   = 7 * 86400   # 7 days — fix #6
 KNOWN_GITHUB_REPOS:  dict[str, str]             = {}
 KNOWN_GITLAB_REPOS:  dict[str, tuple[str, str]] = {}
 KNOWN_RELEASE_PAGES: dict[str, str]             = {}
-KNOWN_CUSTOM:        dict[str, dict]            = {}   # custom parsers
+DEFAULT_CUSTOM: dict[str, dict] = {
+    "firefox": {"parser": "mozilla", "url": "https://www.mozilla.org/en-US/firefox/releases/"},
+    "thunderbird": {"parser": "mozilla", "url": "https://www.thunderbird.net/en-US/thunderbird/releases/"},
+    "krita": {"parser": "krita", "url": "https://krita.org/en/"},
+    "scribus": {
+        "parser": "mantisbt",
+        "url": "https://bugs.scribus.net/changelog_page.php",
+    },
+    # Use the Atom newsfeed which contains release announcements and summaries
+    "filezilla": {"parser": "filezilla", "url": "https://filezilla-project.org/newsfeed.php"},
+}
+KNOWN_CUSTOM:        dict[str, dict]            = DEFAULT_CUSTOM.copy()   # custom parsers (merged with mappings)
 
+# Known GitLab-like hosts that do not literally contain "gitlab" in the hostname
+# (invent.kde.org, source.kde.org, etc). Extend this list if you find more.
+KNOWN_GITLAB_LIKE = {
+    "gitlab.com",
+    "gitlab.gnome.org",
+    "invent.kde.org",
+    "source.kde.org",
+    "gitlab.archlinux.org",
+}
+
+def _is_gitlab_host(host: str) -> bool:
+    """Return True if host is a GitLab instance we should treat as GitLab."""
+    if not host:
+        return False
+    h = host.lower()
+    if "gitlab" in h:
+        return True
+    if any(h.endswith(k) for k in KNOWN_GITLAB_LIKE):
+        return True
+    return False
 
 def _apply_mappings(data: dict):
     global KNOWN_GITHUB_REPOS, KNOWN_GITLAB_REPOS, KNOWN_RELEASE_PAGES, KNOWN_CUSTOM
     KNOWN_GITHUB_REPOS  = data.get("github", {})
     KNOWN_RELEASE_PAGES = data.get("release_pages", {})
-    KNOWN_CUSTOM        = data.get("custom", {})
+    # Merge any remotely-provided custom mappings with local defaults.
+    # Do not discard default metadata such as host/repo when the remote
+    # mapping only provides a parser or URL override.
+    KNOWN_CUSTOM = {}
+    for pkg, entry in DEFAULT_CUSTOM.items():
+        KNOWN_CUSTOM[pkg] = dict(entry)
+    for pkg, entry in (data.get("custom") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        existing = KNOWN_CUSTOM.get(pkg, {})
+        KNOWN_CUSTOM[pkg] = {**existing, **entry}
     raw_gl = data.get("gitlab", {})
     KNOWN_GITLAB_REPOS = {
         pkg: (info["host"], info["repo"])
@@ -863,19 +940,59 @@ def _fetch_parallel(urls: list[str], timeout: int = 12) -> dict[str, Optional[st
 
 def _scrape_custom(pkg_name: str, entry: dict) -> Optional[dict]:
     """Dispatch to custom parser based on entry['parser'] field."""
-    url    = entry.get("url", "")
     parser = entry.get("parser", "")
+    if parser == "gitlab":
+        host = entry.get("host", "")
+        repo = entry.get("repo", "")
+        if host and repo:
+            return _gitlab_releases(host, repo, pkg_name)
+        return None
+
+    url    = entry.get("url", "")
     if not url:
         return None
     body = http_get(url, timeout=16)
     if not body:
         return None
     if parser == "mantisbt":
-        return _scrape_mantisbt(body, url)
+        result = _scrape_mantisbt(body, url)
+        if result and result.get("versions"):
+            return result
+        host = entry.get("host", "")
+        repo = entry.get("repo", "")
+        if host and repo:
+            gitlab_result = _gitlab_releases(host, repo, pkg_name)
+            if gitlab_result and gitlab_result.get("versions"):
+                return gitlab_result
+        # Detect if the page is a bot-protection challenge (Anubis, Cloudflare, etc)
+        # and try git fallback instead of giving up
+        if _is_bot_protection_page(body):
+            _dbg(f"[mantisbt] bot-protection page detected, trying git fallback")
+            host = entry.get("host", "")
+            repo = entry.get("repo", "")
+            if host and repo:
+                gitlab_result = _gitlab_releases(host, repo, pkg_name)
+                if gitlab_result and gitlab_result.get("versions"):
+                    return gitlab_result
+        if url:
+            return {
+                "versions": [{"version": pkg_name, "date": "",
+                              "changes": [f"See {url} for details."]}],
+                "source": f"Custom (mantisbt) — {url}",
+                "_link_only": True,
+                "_link_url": url,
+            }
+        return None
     if parser == "text_file":
         return _scrape_text_file(body)
     if parser == "github_raw":
         return _scrape_github_raw_changelog(body)
+    if parser == "mozilla":
+        return _scrape_mozilla(url, body)
+    if parser == "krita":
+        return _scrape_krita(body, url)
+    if parser == "filezilla":
+        return _scrape_filezilla_changelog(body, url)
     # Unknown parser type — nothing we know how to parse; caller falls
     # back to showing a direct link to `url`.
     return None
@@ -1133,9 +1250,36 @@ def _parse_mozilla_notes(html_text: str) -> list[str]:
             clean, re.DOTALL | re.IGNORECASE)
     body = main_match.group(1) if main_match else clean
 
+    def _mozilla_text_ok(text: str) -> bool:
+        if not text or len(text) < 15 or len(text) > 500:
+            return False
+        if re.match(r'^(?:Windows|Mac|macOS|Linux|Android|iOS|GTK\+?|GTK|Requires|Supported|Release)\b',
+                    text, re.IGNORECASE):
+            return False
+        if re.search(r'\b(?:Windows|Mac|macOS|Linux|GTK\+?|Android|iOS)\b.*\b(?:later|higher|minimum|requires|supported)\b',
+                     text, re.IGNORECASE):
+            return False
+        if re.match(r'^[\d\.]+\s+\d{4}-\d{2}-\d{2}$', text):
+            return False
+        if 'Mozilla Public License' in text:
+            return False
+        return True
+
     changes = []
 
-    # Step 3: Look for section headings + their list items
+    # Step 3: Prefer actual Thunderbird/Mozilla note blocks first.
+    note_texts = re.findall(
+        r'<div[^>]*class=["\"][^"\"]*note-text[^"\"]*["\"][^>]*>(.*?)</div>',
+        body, re.DOTALL | re.IGNORECASE)
+    for note_html in note_texts:
+        for p in re.findall(r'<p[^>]*>(.*?)</p>', note_html, re.DOTALL | re.IGNORECASE):
+            text = _strip_html(p).strip()
+            if _mozilla_text_ok(text) and text not in changes:
+                changes.append(text)
+    if changes:
+        return changes[:12]
+
+    # Step 4: Look for section headings + their list items
     # Modern Mozilla pages: <section> or <div> with class containing new/fixed/changed/security
     sections = re.findall(
         r'<(?:section|div)[^>]*class="[^"]*'
@@ -1154,11 +1298,7 @@ def _parse_mozilla_notes(html_text: str) -> list[str]:
         items = re.findall(r'<li[^>]*>(.*?)</li>', section, re.DOTALL)
         for item in items:
             text = _strip_html(item).strip()
-            # Filter: must be 15–500 chars, no CSS/JS noise
-            if (15 < len(text) < 500
-                    and '{' not in text
-                    and not text.startswith('.')
-                    and not re.search(r'fill:|behavior:|url\(', text)):
+            if _mozilla_text_ok(text) and not re.search(r'fill:|behavior:|url\(', text):
                 changes.append(text)
 
     if not changes:
@@ -1166,13 +1306,153 @@ def _parse_mozilla_notes(html_text: str) -> list[str]:
         items = re.findall(r'<li[^>]*>(.*?)</li>', body, re.DOTALL)
         for item in items:
             text = _strip_html(item).strip()
-            if (15 < len(text) < 500
-                    and '{' not in text
-                    and not text.startswith('.')
-                    and not re.search(r'fill:|behavior:|url\(', text)):
+            if _mozilla_text_ok(text) and not re.search(r'fill:|behavior:|url\(', text):
                 changes.append(text)
 
     return changes[:12]
+
+
+def _scrape_filezilla_changelog(body: str, url: str) -> Optional[dict]:
+    """Parse FileZilla's changelog.php page into versions.
+
+    This parser looks for headings containing version-like strings and
+    collects nearby list items or paragraphs as change entries.
+    """
+    if not body:
+        return None
+
+    versions = []
+    # If the URL returns an Atom/RSS feed, parse <entry> items
+    if body.lstrip().startswith('<?xml') or '<feed' in body.lower() or '<rss' in body.lower():
+        entries = re.findall(r'<entry>(.*?)</entry>', body, flags=re.DOTALL|re.IGNORECASE)
+        for e in entries[:8]:
+            title_m = re.search(r'<title[^>]*>(.*?)</title>', e, re.DOTALL|re.IGNORECASE)
+            updated_m = re.search(r'<updated[^>]*>(.*?)</updated>', e, re.DOTALL|re.IGNORECASE)
+            summary_m = re.search(r'<summary[^>]*>(.*?)</summary>', e, re.DOTALL|re.IGNORECASE)
+            title = _strip_html(title_m.group(1)) if title_m else ''
+            date = (updated_m.group(1) if updated_m else '')[:10]
+            summary = summary_m.group(1) if summary_m else ''
+            # Extract version number from title, e.g. 'FileZilla Client 3.70.6 released'
+            ver_m = re.search(r'(\d+\.\d+(?:\.\d+)?)', title)
+            ver = ver_m.group(1) if ver_m else title
+            changes = []
+            # summary may contain XHTML; extract <li> or paragraphs
+            lis = re.findall(r'<li[^>]*>(.*?)</li>', summary, re.DOTALL|re.IGNORECASE)
+            if lis:
+                for li in lis[:10]:
+                    t = _strip_html(li).strip()
+                    if t:
+                        changes.append(t)
+            else:
+                # fallback: paragraphs or plain text
+                ps = re.findall(r'<p[^>]*>(.*?)</p>', summary, re.DOTALL|re.IGNORECASE)
+                if ps:
+                    for p in ps[:6]:
+                        for line in _strip_html(p).splitlines():
+                            s = line.strip()
+                            if s:
+                                changes.append(s)
+                else:
+                    txt = _strip_html(summary).strip()
+                    if txt:
+                        for line in txt.splitlines():
+                            s=line.strip()
+                            if s:
+                                changes.append(s)
+            if changes:
+                versions.append({"version": ver, "date": date, "changes": changes[:10]})
+        return {"versions": versions, "source": f"FileZilla feed — {url}"} if versions else None
+
+    # Otherwise fall back to site scraping: look for list items or paragraphs
+    lis = re.findall(r'<li[^>]*>(.*?)</li>', body, re.DOTALL|re.IGNORECASE)
+    if lis:
+        # Use the first group of list items as a loose changelog
+        changes = [_strip_html(li).strip() for li in lis[:12] if _strip_html(li).strip()]
+        if changes:
+            return {"versions": [{"version": "latest", "date": "", "changes": changes[:10]}],
+                    "source": f"FileZilla changelog page — {url}"}
+
+    return None
+
+
+def _scrape_krita(body: str, url: str) -> Optional[dict]:
+    """Parse Krita release posts from the Krita website."""
+    if not body:
+        return None
+
+    def _extract_post_area(html: str) -> str:
+        m = re.search(r'<div[^>]+class=["\']?post["\']?[^>]*>', html, re.IGNORECASE)
+        if not m:
+            return html
+        start = m.start()
+        segment = html[start:]
+        depth = 0
+        pos = 0
+        while pos < len(segment):
+            if segment[pos:pos+4].lower() == '<div':
+                depth += 1
+                pos += 4
+                continue
+            if segment[pos:pos+6].lower() == '</div>':
+                depth -= 1
+                pos += 6
+                if depth == 0:
+                    return segment[:pos]
+                continue
+            pos += 1
+        return segment
+
+    candidates = []
+    for href in re.findall(r'href=["\']?([^"\'\s>]+)["\']?', body, re.IGNORECASE):
+        if re.search(r'/en/posts/\d{4}/krita-[^/]+-released/?$', href, re.IGNORECASE):
+            candidates.append(urllib.parse.urljoin(url, href))
+    candidates = list(dict.fromkeys(candidates))[:8]
+
+    versions = []
+    for post_url in candidates:
+        post_body = http_get(post_url, timeout=12)
+        if not post_body:
+            continue
+
+        title = ""
+        m = re.search(r'<h1[^>]*>(.*?)</h1>', post_body, re.IGNORECASE | re.DOTALL)
+        if m:
+            title = _strip_html(m.group(1)).strip()
+
+        ver = ""
+        if title:
+            vm = re.search(r'Krita\s*([0-9]+(?:\.[0-9]+)+)', title, re.IGNORECASE)
+            ver = vm.group(1) if vm else title
+
+        date = ""
+        dm = re.search(
+            r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+            post_body, re.IGNORECASE)
+        if not dm:
+            dm = re.search(r'<span[^>]*>([^<]*\d{4})</span>', post_body, re.IGNORECASE)
+        if dm:
+            date = dm.group(1)[:10]
+
+        post_area = _extract_post_area(post_body)
+        changes = []
+
+        for li in re.findall(r'<li[^>]*>(.*?)</li>', post_area, re.IGNORECASE | re.DOTALL):
+            text = _strip_html(li).strip()
+            if text and len(text) > 10:
+                changes.append(text)
+        if not changes:
+            for p in re.findall(r'<p[^>]*>(.*?)</p>', post_area, re.IGNORECASE | re.DOTALL):
+                text = _strip_html(p).strip()
+                if text and len(text) > 20:
+                    changes.extend([line.strip() for line in text.splitlines() if line.strip()])
+                    break
+
+        if ver and changes:
+            versions.append({"version": ver, "date": date, "changes": changes[:10]})
+        elif title and changes:
+            versions.append({"version": title, "date": date, "changes": changes[:10]})
+
+    return {"versions": versions, "source": f"Krita release posts — {url}"} if versions else None
 
 
 # ─── Changelog: upstream GitHub / GitLab ─────────────────────────────────────
@@ -1200,39 +1480,105 @@ def _repo_name_plausible(pkg_name: str, repo_path: str) -> bool:
         return True
     return False
 
-
 def _find_repo_link_in_page(url: str) -> Optional[tuple]:
     """
     Scan a homepage for the project's own source-code repository link.
-    Returns ("github", "owner/repo") or ("gitlab", "host", "owner/repo"),
-    or None. Many app homepages (e.g. apps.gnome.org/Calendar) link only
-    to GitLab, not GitHub — the old GitHub-only scan missed these entirely.
+    Returns ("github", "owner/repo") or ("gitlab", "host", "owner[/subgroup]/repo"),
+    or None. Logs every candidate via _dbg for debugging.
+    Uses shorter timeout (8s) to avoid blocking on slow/redirecting homepages.
     """
-    body = http_get(url, timeout=10)
+    body = http_get(url, timeout=8)
     if not body:
+        _dbg(f"[homepage scan] could not fetch {url}")
         return None
 
-    SKIP_SUFFIXES = (
-        "issues", "pulls", "wiki", "releases", "tags",
-        "commits", "blob", "tree", "actions", "merge_requests",
-        "pipelines", "snippets",
-    )
+    # helper to normalize a repo URL/path: strip '/-/' and known resource suffixes
+    def normalize_repo_from_href(href: str):
+        # Remove query/fragment
+        h = href.split("#", 1)[0].split("?", 1)[0]
+        # If it contains '/-/', keep only the left side (repo root)
+        if "/-/" in h:
+            h = h.split("/-/", 1)[0]
+        # Remove common trailing resource tokens
+        for tok in ("/releases", "/tags", "/issues", "/pulls", "/commits", "/blob", "/tree", "/work_items", "/raw"):
+            idx = h.find(tok)
+            if idx != -1:
+                h = h[:idx]
+        return h.rstrip("/")
 
-    for m in re.findall(
-            r'https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)', body):
-        parts = m.rstrip("/").split("/")
-        if len(parts) == 2 and parts[1] not in SKIP_SUFFIXES:
-            return ("github", m.rstrip(".git").rstrip("/"))
+    # Find all href attributes, including unquoted values.
+    hrefs = re.findall(r'href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', body)
+    hrefs = [h for match in hrefs for h in match if h]
+    seen = set()
+    for raw in hrefs:
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        # Resolve protocol-relative and relative URLs
+        if raw.startswith("//"):
+            raw_full = "https:" + raw
+        elif raw.startswith("http://") or raw.startswith("https://"):
+            raw_full = raw
+        else:
+            # Make relative URLs absolute using the homepage base
+            try:
+                raw_full = urllib.parse.urljoin(url, raw)
+            except Exception:
+                raw_full = raw
+        low = raw_full.lower()
+        # Filter only GitHub / GitLab-looking links
+        if "github.com" not in low and "gitlab" not in low and not any(low.endswith(k) for k in ("invent.kde.org","source.kde.org")):
+            continue
 
-    for host_m, repo_m in re.findall(
-            r'https?://(gitlab\.[A-Za-z0-9.-]+)/([A-Za-z0-9_.\-/]+?)(?:\.git)?(?:["\'\s<)]|$)',
-            body):
-        parts = repo_m.rstrip("/").split("/")
-        if len(parts) >= 2 and parts[-1] not in SKIP_SUFFIXES and not any(
-                p in ("-", "") for p in parts):
-            return ("gitlab", host_m, "/".join(parts[:2]))
+        _dbg(f"[homepage scan] candidate href: {raw_full}")
 
+        # Attempt to parse host+path
+        try:
+            p = urllib.parse.urlparse(raw_full)
+        except Exception:
+            _dbg(f"[homepage scan] parse failed for {raw_full}")
+            continue
+        host = (p.netloc or "").lower()
+        path = p.path or ""
+        path = path.lstrip("/")
+
+        # If host is github
+        if "github.com" in host:
+            # require at least owner/repo
+            parts = [s for s in path.split("/") if s and s != "-"]
+            if len(parts) >= 2:
+                repo = "/".join(parts[:len(parts)])  # keep nested groups if present
+                # strip .git suffix
+                repo = repo.rstrip(".git").rstrip("/")
+                _dbg(f"[homepage scan] github candidate -> {repo}")
+                return ("github", repo)
+            else:
+                _dbg(f"[homepage scan] github candidate rejected (not owner/repo): {raw_full}")
+                continue
+
+        # If host looks like a GitLab instance
+        if "gitlab" in host or host.endswith("invent.kde.org") or host.endswith("source.kde.org") or host.endswith("gitlab.gnome.org"):
+            # Normalize and strip trailing pieces like /-/work_items
+            base = normalize_repo_from_href(raw_full)
+            # base may be something like https://gitlab.gnome.org/GNOME/gnome-calendar
+            m = re.match(r'https?://([^/]+)/(.+)', base)
+            if not m:
+                _dbg(f"[homepage scan] gitlab candidate parse fail: {base}")
+                continue
+            ghost, gpath = m.group(1), m.group(2)
+            parts = [s for s in gpath.split("/") if s and s != "-"]
+            if len(parts) >= 2:
+                repo = "/".join(parts)  # keep subgroup/project if present
+                repo = repo.rstrip(".git").rstrip("/")
+                _dbg(f"[homepage scan] gitlab candidate -> host={ghost} repo={repo}")
+                return ("gitlab", ghost, repo)
+            else:
+                _dbg(f"[homepage scan] gitlab candidate rejected (not group/project): {raw_full}")
+                continue
+
+    _dbg("[homepage scan] no repo link found")
     return None
+
 
 
 def _find_github_via_homepage(url: str, pkg_name: str = "") -> Optional[str]:
@@ -1289,6 +1635,70 @@ def _find_repo_via_homepage(url: str, pkg_name: str = "") -> Optional[tuple]:
 
     return None
 
+
+# -- Probe common GitLab hosts using sensible guesses derived from pkg name --
+# Try this when homepage scanning failed to discover a repo link (covers
+# JS-rendered homepages like apps.gnome.org).
+_EXTRA_GITLAB_HOSTS = [
+    "gitlab.gnome.org",
+    "invent.kde.org",
+    "source.kde.org",
+    "gitlab.com",
+    "gitlab.archlinux.org",
+]
+
+def _probe_known_gitlab_hosts(pkg_name: str) -> Optional[dict]:
+    """
+    Try a few host+path guesses derived from pkg_name against common GitLab
+    instances. If a project exists, call _gitlab_releases() and return its result.
+    Logs attempts with _dbg so the debug expander shows what was tried.
+    """
+    name = (pkg_name or "").strip()
+    if not name:
+        return None
+
+    candidates: list[str] = []
+    # Keep original package name
+    candidates.append(name)
+    # Try without common prefixes
+    for pref in ("gnome-", "gdm-", "lib", "libgnome-"):
+        if name.startswith(pref):
+            candidates.append(name[len(pref):])
+    # Try GNOME group prefix (very common for GNOME apps)
+    candidates.append(f"GNOME/{name}")
+    # Also try GNOME group with the stripped name if we made one
+    if name.startswith("gnome-"):
+        stripped = name[len("gnome-"):]
+        candidates.append(f"GNOME/{stripped}")
+
+    # Deduplicate but keep order
+    seen_cand = []
+    for c in candidates:
+        cclean = c.strip("/")
+        if cclean and cclean not in seen_cand:
+            seen_cand.append(cclean)
+    candidates = seen_cand
+
+    for host in _EXTRA_GITLAB_HOSTS:
+        for cand in candidates:
+            _dbg(f"[host-probe] trying https://{host}/{cand}")
+            # Query the GitLab project endpoint to check existence
+            enc = urllib.parse.quote(cand, safe="")
+            proj = http_get_json(f"https://{host}/api/v4/projects/{enc}")
+            if proj is None:
+                _dbg(f"[host-probe] {host}/{cand} -> no project (or API returned nothing)")
+                continue
+            # Project exists — fetch releases/tags via existing logic
+            _dbg(f"[host-probe] {host}/{cand} -> project exists, attempting _gitlab_releases")
+            try:
+                r = _gitlab_releases(host, cand, pkg_name)
+                if r and r.get("versions"):
+                    _dbg(f"[host-probe] {host}/{cand} -> releases found ✓")
+                    return r
+                _dbg(f"[host-probe] {host}/{cand} -> project exists but no release info")
+            except Exception as e:
+                _dbg(f"[host-probe] {host}/{cand} -> exception in _gitlab_releases: {e}")
+    return None
 
 def _fetch_github_changelog_file(repo: str) -> Optional[dict]:
     """
@@ -1349,33 +1759,40 @@ def _github_releases(repo: str, _pkg_name: str) -> Optional[dict]:
 
 def _extract_version_from_tag(tag_name: str) -> str:
     """
-    Normalise a tag name into a readable version string. Handles both
-    simple semver tags ("v3.2.1" -> "3.2.1") and GNOME-style uppercase
-    project-prefixed tags ("GNOME_COLOR_MANAGER_3_11_90" -> "3.11.90").
+    Normalise a tag name into a readable version string. Handles:
+    - Simple semver: "v3.2.1" -> "3.2.1"
+    - GNOME-style: "GNOME_COLOR_MANAGER_3_11_90" -> "3.11.90"
+    - Release prefixes: "release-2.5" -> "2.5"
     """
-    # GNOME-style: PROJECT_NAME_X_Y_Z -> take the trailing numeric run
-    # and join with dots (the project prefix uses underscores throughout,
-    # including between version components).
-    m = re.search(r'((?:\d+_)+\d+)$', tag_name)
+    t = tag_name.lstrip("vV")
+    # Remove common release- prefix
+    t = re.sub(r'^release[-_]', '', t, flags=re.I)
+    # GNOME-style: PROJECT_NAME_X_Y_Z -> trailing numeric run with dots
+    m = re.search(r'((?:\d+_)+\d+)$', t)
     if m:
         return m.group(1).replace("_", ".")
-    return tag_name.lstrip("vV")
+    return t
+
+
+# ─── GitLab hosts with known API blocking but git access working ──────────────
+_GIT_FIRST_HOSTS = {"invent.kde.org", "source.kde.org"}
 
 
 def _gitlab_releases(host: str, repo: str, _pkg_name: str) -> Optional[dict]:
     """
     Priority:
-    1. GitLab Releases API (/releases) — formal Release objects with
-       description text. Many projects never publish these.
-    2. Tags API (/repository/tags) — every project has these; some tag
-       messages contain real changelog text, others say "no release notes"
-       (GitLab's literal placeholder when a tag has an empty message).
-    3. A NEWS/CHANGELOG file in the repo root, fetched raw via the
-       /-/raw/<branch>/<file> URL — common for GNOME and many C projects
-       that don't use GitLab's Release feature at all.
-    4. Commit log — last resort when the project is essentially
-       unmaintained or never wrote changelog-style tag messages.
+    1. For known bot-protected hosts, try git fallback first (API blocked).
+    2. GitLab Releases API (/releases) — formal Release objects.
+    3. Tags API (/repository/tags) with real changelog text.
+    4. A NEWS/CHANGELOG file in the repo root.
+    5. Commit log — last resort.
     """
+    # For known problematic hosts, try git access before API calls
+    if host in _GIT_FIRST_HOSTS:
+        git_result = _gitlab_git_fallback(host, repo, _pkg_name)
+        if git_result and git_result.get("versions"):
+            return git_result
+    
     encoded = urllib.parse.quote(repo, safe="")
 
     data = http_get_json(f"https://{host}/api/v4/projects/{encoded}/releases?per_page=6")
@@ -1422,6 +1839,10 @@ def _gitlab_releases(host: str, repo: str, _pkg_name: str) -> Optional[dict]:
     if news:
         return news
 
+    git_fallback = _gitlab_git_fallback(host, repo, _pkg_name)
+    if git_fallback:
+        return git_fallback
+
     # Last resort: raw commit log, filtered the same way the Arch GitLab
     # fallback is — drops PGP noise and non-meaningful housekeeping commits.
     commits = http_get_json(
@@ -1450,10 +1871,12 @@ def _gitlab_releases(host: str, repo: str, _pkg_name: str) -> Optional[dict]:
 
 def _fetch_gitlab_news_file(host: str, repo: str) -> Optional[dict]:
     """Try NEWS/CHANGELOG files via GitLab's raw-file endpoint, across
-    the common default branch names and filenames."""
+    common default branch names and filenames."""
     encoded = urllib.parse.quote(repo, safe="")
-    filenames = ["NEWS", "CHANGELOG", "NEWS.md", "CHANGELOG.md"]
-    branches  = ["master", "main", "HEAD"]
+    filenames = ["NEWS", "CHANGELOG", "NEWS.md", "CHANGELOG.md",
+                 "CHANGES", "CHANGES.md", "HISTORY", "HISTORY.md"]
+    # Try common branch patterns; include develop/dev for active projects
+    branches  = ["main", "master", "develop", "dev", "HEAD", "release"]
     urls = [
         f"https://{host}/{repo}/-/raw/{branch}/{fname}"
         for branch in branches for fname in filenames
@@ -1471,12 +1894,96 @@ def _fetch_gitlab_news_file(host: str, repo: str) -> Optional[dict]:
     return None
 
 
+def _gitlab_git_fallback(host: str, repo: str, _pkg_name: str) -> Optional[dict]:
+    if not cmd_exists("git"):
+        return None
+    repo_url = f"https://{host}/{repo}.git"
+    # Use shorter timeout for git operations; some repos may be slow/blocked
+    out, _, rc = run_git(["git", "ls-remote", "--tags", "--refs", repo_url], timeout=10)
+    if rc != 0 or not out:
+        return None
+
+    tags: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        if not ref.startswith("refs/tags/"):
+            continue
+        if ref.endswith("^{}"):
+            continue
+        tag = ref[len("refs/tags/"):]
+        tags.append((tag, sha))
+    if not tags:
+        return None
+
+    def version_key(tag_name: str):
+        t = tag_name.lstrip("vV")
+        parts = re.split(r"[._-]", t)
+        key = []
+        for part in parts:
+            if part.isdigit():
+                key.append(int(part))
+            else:
+                key.append(part.lower())
+        return tuple(key)
+
+    tags.sort(key=lambda tr: version_key(tr[0]), reverse=True)
+    tags = tags[:6]
+
+    versions = []
+    with tempfile.TemporaryDirectory(prefix="pakku-git-") as tmpdir:
+        init_rc = run(["git", "init", "--bare", tmpdir])[2]
+        if init_rc != 0:
+            return None
+        git = ["git", "-C", tmpdir]
+        if run(git + ["remote", "add", "origin", repo_url])[2] != 0:
+            return None
+
+        for tag, _sha in tags:
+            fetch_rc = run(git + ["fetch", "--quiet", "--depth", "1", "origin",
+                                  f"refs/tags/{tag}:refs/tags/{tag}"])[2]
+            if fetch_rc != 0:
+                continue
+            date_out, _, date_rc = run(git + ["show", "-s", "--format=%cI", f"refs/tags/{tag}"])
+            body_out, _, body_rc = run(git + ["show", "-s", "--format=%B", f"refs/tags/{tag}"])
+            if date_rc != 0 or body_rc != 0:
+                continue
+            date = date_out.strip().splitlines()[0] if date_out.strip() else ""
+            changes = _parse_md_changelog(body_out)[:10]
+            if not changes:
+                lines = [line.strip() for line in body_out.splitlines() if line.strip()]
+                if lines:
+                    changes = [lines[0]]
+            versions.append({
+                "version": _extract_version_from_tag(tag),
+                "date": date,
+                "changes": changes or [f"Release {tag}"],
+            })
+            if len(versions) >= 6:
+                break
+    if versions:
+        return {"versions": versions, "source": f"GitLab git — {host}/{repo}"}
+    return None
+
+
 def _upstream_changelog(url: str, pkg_name: str, version: str) -> Optional[dict]:
     name = pkg_name.lower()
     # 0. Custom parsers (mantisbt, text_file, github_raw, etc.)
     if name in KNOWN_CUSTOM:
-        r = _scrape_custom(pkg_name, KNOWN_CUSTOM[name])
+        entry = KNOWN_CUSTOM[name]
+        r = _scrape_custom(pkg_name, entry)
         if r and r.get("versions"): return r
+        url = entry.get("url", "")
+        if url:
+            return {
+                "versions": [{"version": version, "date": "",
+                              "changes": [f"See {url} for details."]}],
+                "source": f"Custom ({entry.get('parser', '')}) — {url}",
+                "_link_only": True,
+                "_link_url": url,
+            }
     # 1. Dedicated release page — direct link only, no scraping (see
     #    _check_mappings_first for the rationale; kept consistent here).
     if name in KNOWN_RELEASE_PAGES:
@@ -1510,15 +2017,36 @@ def _upstream_changelog(url: str, pkg_name: str, version: str) -> Optional[dict]
         r = _gitlab_releases(gl.group(1), gl.group(2).removesuffix(".git"), pkg_name)
         if r and r.get("versions"): return r
     # 6. Homepage scraping (GitHub or GitLab — whichever the homepage links to)
+    fallback_link = None
     found = _find_repo_via_homepage(url, pkg_name)
     if found:
         if found[0] == "github":
             r = _github_releases(found[1], pkg_name)
+            if r and r.get("versions"): return r
+            fallback_link = f"https://github.com/{found[1]}/releases"
         else:
             r = _gitlab_releases(found[1], found[2], pkg_name)
-        if r and r.get("versions"): return r
-    return None
+            if r and r.get("versions"): return r
+            fallback_link = f"https://{found[1]}/{found[2]}/-/releases"
 
+    # 7b. As a last attempt before falling back to Arch packaging, probe
+    # a few known GitLab hosts using sensible guesses derived from the
+    # package name (handles JS-driven homepages like apps.gnome.org).
+    _dbg("[7b] probing known GitLab hosts with package-name-derived guesses")
+    probe_r = _probe_known_gitlab_hosts(pkg_name)
+    if probe_r and probe_r.get("versions"):
+        _dbg("[7b] host-probe: hit")
+        return probe_r
+    _dbg("[7b] host-probe: no usable data")
+    if fallback_link:
+        return {
+            "versions": [{"version": version or "", "date": "",
+                          "changes": [f"See {fallback_link} for details."]}],
+            "source": "Upstream repo link",
+            "_link_only": True,
+            "_link_url": fallback_link,
+        }
+    return None
 
 # ─── Per-source changelog functions ──────────────────────────────────────────
 
@@ -1557,6 +2085,35 @@ def _check_mappings_first(pkg: Package) -> Optional[dict]:
             "versions": [{"version": pkg.version, "date": "",
                           "changes": [f"See {url} for details."]}],
             "source": f"Release page — {url}",
+            "_link_only": True,
+            "_link_url": url,
+        }
+
+    # Known GitLab repo mapping from mappings.json should beat local AppStream.
+    if name in KNOWN_GITLAB_REPOS:
+        host, repo = KNOWN_GITLAB_REPOS[name]
+        r = _gitlab_releases(host, repo, pkg.name)
+        if r and r.get("versions"):
+            return r
+        url = f"https://{host}/{repo}/-/releases"
+        return {
+            "versions": [{"version": pkg.version, "date": "",
+                          "changes": [f"See {url} for details."]}],
+            "source": f"GitLab repo mapping — {host}/{repo}",
+            "_link_only": True,
+            "_link_url": url,
+        }
+
+    if name in KNOWN_GITHUB_REPOS:
+        repo = KNOWN_GITHUB_REPOS[name]
+        r = _github_releases(repo, pkg.name)
+        if r and r.get("versions"):
+            return r
+        url = f"https://github.com/{repo}/releases"
+        return {
+            "versions": [{"version": pkg.version, "date": "",
+                          "changes": [f"See {url} for details."]}],
+            "source": f"GitHub repo mapping — {repo}",
             "_link_only": True,
             "_link_url": url,
         }
@@ -1697,23 +2254,38 @@ def fetch_changelog_pacman(pkg: Package) -> dict:
     #    bumps, rebuild notes), never the upstream project's real
     #    changelog, so it should be a last resort, not a shortcut that
     #    pre-empts finding the real upstream source.
+    fallback_link = None
     if pkg.url:
         found = _find_repo_via_homepage(pkg.url, pkg.name)
         if found:
             if found[0] == "github":
                 _dbg(f"[7] homepage scan found GitHub repo: {found[1]}")
                 r = _github_releases(found[1], pkg.name)
+                if r and r.get("versions"):
+                    _dbg("[7] homepage-discovered repo: hit")
+                    return r
+                fallback_link = f"https://github.com/{found[1]}/releases"
             else:
                 _dbg(f"[7] homepage scan found GitLab repo: {found[1]}/{found[2]}")
                 r = _gitlab_releases(found[1], found[2], pkg.name)
-            if r and r.get("versions"):
-                _dbg("[7] homepage-discovered repo: hit")
-                return r
+                if r and r.get("versions"):
+                    _dbg("[7] homepage-discovered repo: hit")
+                    return r
+                fallback_link = f"https://{found[1]}/{found[2]}/-/releases"
             _dbg("[7] homepage-discovered repo: no usable data")
         else:
             _dbg("[7] homepage scan: no repo link found (or rejected by plausibility check)")
     else:
         _dbg("[7] no package URL to scan")
+
+    if fallback_link:
+        return {
+            "versions": [{"version": pkg.version, "date": "",
+                          "changes": [f"See {fallback_link} for details."]}],
+            "source": "Upstream repo link",
+            "_link_only": True,
+            "_link_url": fallback_link,
+        }
 
     # 8. Arch packaging GitLab — absolute last resort. Filters PGP noise
     # and non-meaningful housekeeping commits, but this only ever reflects
@@ -1846,23 +2418,38 @@ def fetch_changelog_aur(pkg: Package) -> dict:
     # commits, never the upstream project's real changelog, so it should
     # be a last resort rather than something that pre-empts finding the
     # real upstream source via the package's homepage.
+    fallback_link = None
     if pkg.url:
         found = _find_repo_via_homepage(pkg.url, pkg.name)
         if found:
             if found[0] == "github":
                 _dbg(f"[6] homepage scan found GitHub repo: {found[1]}")
                 r = _github_releases(found[1], pkg.name)
+                if r and r.get("versions"):
+                    _dbg("[6] homepage-discovered repo: hit")
+                    return r
+                fallback_link = f"https://github.com/{found[1]}/releases"
             else:
                 _dbg(f"[6] homepage scan found GitLab repo: {found[1]}/{found[2]}")
                 r = _gitlab_releases(found[1], found[2], pkg.name)
-            if r and r.get("versions"):
-                _dbg("[6] homepage-discovered repo: hit")
-                return r
+                if r and r.get("versions"):
+                    _dbg("[6] homepage-discovered repo: hit")
+                    return r
+                fallback_link = f"https://{found[1]}/{found[2]}/-/releases"
             _dbg("[6] homepage-discovered repo: no usable data")
         else:
             _dbg("[6] homepage scan: no repo link found (or rejected by plausibility check)")
     else:
         _dbg("[6] no package URL to scan")
+
+    if fallback_link:
+        return {
+            "versions": [{"version": pkg.version, "date": "",
+                          "changes": [f"See {fallback_link} for details."]}],
+            "source": "Upstream repo link",
+            "_link_only": True,
+            "_link_url": fallback_link,
+        }
 
     # 7. AUR cgit fallback (PKGBUILD commit history) — absolute last resort
     versions = []
@@ -2920,26 +3507,36 @@ class PakkuWindow(Adw.ApplicationWindow):
 
     def _on_submit_source(self, action, param):
         """Open the pakchan web submission page."""
-        Gtk.show_uri(self, "https://dodog.github.io/pakchan/web/", 0)
+        try:
+            Gio.AppInfo.launch_default_for_uri("https://dodog.github.io/pakchan/web/", None)
+        except Exception:
+            _dbg("failed to open submission page in default browser")
 
     # ── Apply updates ─────────────────────────────────────────────────────────
 
     def _apply_updates(self, btn):
         sel = [p for p in self.all_packages if p.checked]
         if not sel: return
-        dlg = Adw.MessageDialog(
-            transient_for=self,
-            heading="Apply updates?",
-            body=f"Update {len(sel)} package(s). A terminal will open.",
-        )
-        dlg.add_response("cancel", "Cancel")
-        dlg.add_response("apply",  "Apply")
-        dlg.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dlg = Gtk.Dialog()
+        dlg.set_transient_for(self)
+        dlg.set_title("Apply updates?")
+        content = dlg.get_content_area()
+        lbl = Gtk.Label(label=f"Update {len(sel)} package(s). A terminal will open.")
+        lbl.set_wrap(True)
+        content.append(lbl)
+        # Add Cancel and Apply buttons using Gtk.ResponseType
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        apply_btn = dlg.add_button("Apply", Gtk.ResponseType.APPLY)
+        # Mark Apply as suggested action so it stands out
+        try:
+            apply_btn.get_style_context().add_class("suggested-action")
+        except Exception:
+            pass
         dlg.connect("response", self._do_apply, sel)
         dlg.present()
 
     def _do_apply(self, dlg, response, sel: list):
-        if response != "apply": return
+        if response != Gtk.ResponseType.APPLY: return
         # Fix #7: shlex.quote all package names — prevents shell injection
         pac = [shlex.quote(p.name) for p in sel if p.repo == "pacman"]
         aur = [shlex.quote(p.name) for p in sel if p.repo == "aur"]
